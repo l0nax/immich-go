@@ -6,8 +6,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/simulot/immich-go/helpers/fshelper"
@@ -28,25 +26,14 @@ import (
 
 */
 
-type LocalAlbum struct {
-	Path string // As found in the files
-	Name string // As found in metadata
-}
-
 type LocalAssetFile struct {
 	// Common fields
-	FileName    string       // The asset's path in the fsys
-	Title       string       // Google Photos may a have title longer than the filename
-	Description string       // Google Photos description
-	Albums      []LocalAlbum // The asset's album, if any
-	Err         error        // keep errors encountered
-	SideCar     *metadata.SideCar
-
-	// Common metadata
-	DateTaken time.Time // the date of capture
-	Latitude  float64   // GPS Latitude
-	Longitude float64   // GPS Longitude
-	Altitude  float64   // GPS Altitude
+	FileName string               // The asset's path in the fsys
+	Title    string               // Google Photos may a have title longer than the filename
+	Albums   []LocalAlbum         // The asset's album, if any
+	Err      error                // keep errors encountered
+	SideCar  metadata.SideCarFile // sidecar file if found
+	Metadata metadata.Metadata    // Metadata fields
 
 	// Google Photos flags
 	Trashed     bool // The asset is trashed
@@ -55,7 +42,8 @@ type LocalAssetFile struct {
 	Favorite    bool
 
 	// Live Photos
-	LivePhotoData string // Filename of MP4 file associated
+	LivePhoto   *LocalAssetFile // Local asset of the movie part
+	LivePhotoID string          // ID of the movie part, just uploaded
 
 	FSys     fs.FS // Asset's file system
 	FileSize int   // File size in bytes
@@ -90,7 +78,7 @@ func (l *LocalAssetFile) Remove() error {
 }
 
 func (l *LocalAssetFile) DeviceAssetID() string {
-	return fmt.Sprintf("%s-%d", strings.ToUpper(l.Title), l.FileSize)
+	return fmt.Sprintf("%s-%d", l.Title, l.FileSize)
 }
 
 // PartialSourceReader open a reader on the current asset.
@@ -107,13 +95,7 @@ func (l *LocalAssetFile) PartialSourceReader() (reader io.Reader, err error) {
 		}
 	}
 	if l.tempFile == nil {
-		tempDir, err := os.UserCacheDir()
-		if err != nil {
-			return nil, err
-		}
-		tempDir = filepath.Join(tempDir, "github.com/simulot/immich-go")
-		os.Mkdir(tempDir, 0700)
-		l.tempFile, err = os.CreateTemp(tempDir, "")
+		l.tempFile, err = os.CreateTemp("", "immich-go_*.tmp")
 		if err != nil {
 			return nil, err
 		}
@@ -121,7 +103,10 @@ func (l *LocalAssetFile) PartialSourceReader() (reader io.Reader, err error) {
 			l.teeReader = io.TeeReader(l.sourceFile, l.tempFile)
 		}
 	}
-	l.tempFile.Seek(0, 0)
+	_, err = l.tempFile.Seek(0, 0)
+	if err != nil {
+		return nil, err
+	}
 	return io.MultiReader(l.tempFile, l.teeReader), nil
 }
 
@@ -135,7 +120,10 @@ func (l *LocalAssetFile) Open() (fs.File, error) {
 		}
 	}
 	if l.tempFile != nil {
-		l.tempFile.Seek(0, 0)
+		_, err = l.tempFile.Seek(0, 0)
+		if err != nil {
+			return nil, err
+		}
 		l.reader = io.MultiReader(l.tempFile, l.sourceFile)
 	} else {
 		l.reader = l.sourceFile
@@ -173,6 +161,7 @@ func (l *LocalAssetFile) IsDir() bool { return false }
 func (l *LocalAssetFile) Name() string {
 	return l.FileName
 }
+
 func (l *LocalAssetFile) Size() int64 {
 	return int64(l.FileSize)
 }
@@ -182,7 +171,7 @@ func (l *LocalAssetFile) Mode() fs.FileMode { return 0 }
 
 // ModTime implements the fs.FILE interface
 func (l *LocalAssetFile) ModTime() time.Time {
-	return l.DateTaken
+	return l.Metadata.DateTaken
 }
 
 // Sys implements the fs.FILE interface

@@ -7,17 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/simulot/immich-go/helpers/tzone"
-
 	"github.com/rwcarlsen/goexif/exif"
 )
 
-func getExifFromReader(r io.Reader) (MetaData, error) {
-	var md MetaData
-	local, err := tzone.Local()
-	if err != nil {
-		return md, err
-	}
+func getExifFromReader(r io.Reader) (Metadata, error) {
+	var md Metadata
 	// Decode the EXIF data
 	x, err := exif.Decode(r)
 	if err != nil && exif.IsCriticalError(err) {

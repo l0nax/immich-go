@@ -9,29 +9,56 @@ import (
 	"github.com/simulot/immich-go/helpers/tzone"
 )
 
+type Metablock struct {
+	Title          string             `json:"title"`
+	Description    string             `json:"description"`
+	Category       string             `json:"category"`
+	Date           *googTimeObject    `json:"date,omitempty"`
+	PhotoTakenTime googTimeObject     `json:"photoTakenTime"`
+	GeoDataExif    googGeoData        `json:"geoDataExif"`
+	GeoData        googGeoData        `json:"geoData"`
+	Trashed        bool               `json:"trashed,omitempty"`
+	Archived       bool               `json:"archived,omitempty"`
+	URLPresent     googIsPresent      `json:"url,omitempty"`         // true when the file is an asset metadata
+	Favorited      bool               `json:"favorited,omitempty"`   // true when starred in GP
+	Enrichments    *googleEnrichments `json:"enrichments,omitempty"` // Album enrichments
+}
+
 type GoogleMetaData struct {
-	Title              string         `json:"title"`
-	Description        string         `json:"description"`
-	Category           string         `json:"category"`
-	DatePresent        googIsPresent  `json:"date,omitempty"` // true when the file is a folder metadata
-	PhotoTakenTime     googTimeObject `json:"photoTakenTime"`
-	GeoDataExif        googGeoData    `json:"geoDataExif"`
-	Trashed            bool           `json:"trashed,omitempty"`
-	Archived           bool           `json:"archived,omitempty"`
-	URLPresent         googIsPresent  `json:"url,omitempty"`       // true when the file is an asset metadata
-	Favorited          bool           `json:"favorited,omitempty"` // true when starred in GP
+	Metablock
 	GooglePhotosOrigin struct {
 		FromPartnerSharing googIsPresent `json:"fromPartnerSharing,omitempty"` // true when this is a partner's asset
 	} `json:"googlePhotosOrigin"`
-	foundInPaths []string // Not in the JSON, keep track of paths where the json has been found
+	AlbumData *Metablock `json:"albumdata"`
+	// Not in the JSON, for local treatment
+	foundInPaths []string //  keep track of paths where the json has been found
+}
+
+func (gmd *GoogleMetaData) UnmarshalJSON(data []byte) error {
+	type gmetadata GoogleMetaData
+	var gg gmetadata
+
+	err := json.Unmarshal(data, &gg)
+	if err != nil {
+		return err
+	}
+
+	// compensate metadata version
+	if gg.AlbumData != nil {
+		gg.Metablock = *gg.AlbumData
+		gg.AlbumData = nil
+	}
+
+	*gmd = GoogleMetaData(gg)
+	return nil
 }
 
 func (gmd GoogleMetaData) isAlbum() bool {
-	return bool(gmd.DatePresent)
+	return gmd.Date != nil
 }
 
 func (gmd GoogleMetaData) isAsset() bool {
-	return bool(gmd.URLPresent)
+	return gmd.PhotoTakenTime.Timestamp != ""
 }
 
 func (gmd GoogleMetaData) isPartner() bool {
@@ -40,8 +67,8 @@ func (gmd GoogleMetaData) isPartner() bool {
 
 // Key return an expected unique key for the asset
 // based on the title and the timestamp
-func (md GoogleMetaData) Key() string {
-	return fmt.Sprintf("%s,%s", md.Title, md.PhotoTakenTime.Timestamp)
+func (gmd GoogleMetaData) Key() string {
+	return fmt.Sprintf("%s,%s", gmd.Title, gmd.PhotoTakenTime.Timestamp)
 }
 
 // googIsPresent is set when the field is present. The content of the field is not relevant
@@ -79,93 +106,71 @@ type googTimeObject struct {
 }
 
 // Time return the time.Time of the epoch
-func (gt googTimeObject) Time() time.Time {
+func (gt *googTimeObject) Time() time.Time {
+	if gt == nil {
+		return time.Time{}
+	}
 	ts, _ := strconv.ParseInt(gt.Timestamp, 10, 64)
+	if ts == 0 {
+		return time.Time{}
+	}
 	t := time.Unix(ts, 0)
 	local, _ := tzone.Local()
 	//	t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
 	return t.In(local)
 }
 
-// // UnmarshalJSON read the googTimeObject from the json
-// func (t *googTimeObject) UnmarshalJSON(data []byte) error {
-// 	type Alias googTimeObject
-// 	aux := &struct {
-// 		Timestamp string `json:"timestamp"`
-// 		*Alias
-// 	}{
-// 		Alias: (*Alias)(t),
-// 	}
+type googleEnrichments struct {
+	Text      string
+	Latitude  float64
+	Longitude float64
+}
 
-// 	err := json.Unmarshal(data, &aux)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	t.Timestamp, err = strconv.ParseInt(aux.Timestamp, 10, 64)
-
-// 	return err
-// }
-
-/*
-	Typical metadata json
-
-	{
-		"title": "Title",
-		"description": "",
-		"access": "",
-		"date": {
-			"timestamp": "0",
-			"formatted": "1 janv. 1970, 00:00:00 UTC"
-		},
-		"location": "",
-		"geoData": {
-			"latitude": 0.0,
-			"longitude": 0.0,
-			"altitude": 0.0,
-			"latitudeSpan": 0.0,
-			"longitudeSpan": 0.0
-		}
+func (ge *googleEnrichments) UnmarshalJSON(b []byte) error {
+	type googleEnrichment struct {
+		NarrativeEnrichment struct {
+			Text string `json:"text"`
+		} `json:"narrativeEnrichment,omitempty"`
+		LocationEnrichment struct {
+			Location []struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+				LatitudeE7  int    `json:"latitudeE7"`
+				LongitudeE7 int    `json:"longitudeE7"`
+			} `json:"location"`
+		} `json:"locationEnrichment,omitempty"`
 	}
 
+	var enrichments []googleEnrichment
 
-	Typical photo metadata
+	err := json.Unmarshal(b, &enrichments)
+	if err != nil {
+		return err
+	}
 
-	{
-		"title": "20161018_140312.mp4",
-		"description": "",
-		"imageViews": "87",
-		"creationTime": {
-			"timestamp": "1476820554",
-			"formatted": "18 oct. 2016, 19:55:54 UTC"
-		},
-		"photoTakenTime": {
-			"timestamp": "1476792192",
-			"formatted": "18 oct. 2016, 12:03:12 UTC"
-		},
-		"geoData": {
-			"latitude": 12.345,
-			"longitude": 1.12345,
-			"altitude": 0.0,
-			"latitudeSpan": 0.0,
-			"longitudeSpan": 0.0
-		},
-		"geoDataExif": {
-			"latitude": 12.345,
-			"longitude": 1.12345,
-			"altitude": 0.0,
-			"latitudeSpan": 0.0,
-			"longitudeSpan": 0.0
-		},
-		"url": "https://photos.google.com/photo/....",
-		"googlePhotosOrigin": {
-			"mobileUpload": {
-			"deviceFolder": {
-				"localFolderName": ""
-			},
-			"deviceType": "ANDROID_PHONE"
+	for _, e := range enrichments {
+		if e.NarrativeEnrichment.Text != "" {
+			ge.Text = addString(ge.Text, "\n", e.NarrativeEnrichment.Text)
+		}
+		if e.LocationEnrichment.Location != nil {
+			for _, l := range e.LocationEnrichment.Location {
+				if l.Name != "" {
+					ge.Text = addString(ge.Text, "\n", l.Name)
+				}
+				if l.Description != "" {
+					ge.Text = addString(ge.Text, " - ", l.Description)
+				}
+				ge.Latitude = float64(l.LatitudeE7) / 10e6
+				ge.Longitude = float64(l.LongitudeE7) / 10e6
 			}
 		}
 	}
+	return err
+}
 
-*/
+func addString(s string, sep string, t string) string {
+	if s != "" {
+		return s + sep + t
+	}
+	return t
+}

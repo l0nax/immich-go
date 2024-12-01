@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/simulot/immich-go/helpers/fshelper"
 	"github.com/simulot/immich-go/helpers/gen"
 	"github.com/simulot/immich-go/immich"
 )
@@ -34,21 +33,22 @@ const (
 )
 
 type StackBuilder struct {
-	dateRange immich.DateRange // Set capture date range
-	stacks    map[Key]Stack
+	dateRange      immich.DateRange // Set capture date range
+	stacks         map[Key]Stack
+	supportedMedia immich.SupportedMedia
 }
 
-func NewStackBuilder() *StackBuilder {
+func NewStackBuilder(supportedMedia immich.SupportedMedia) *StackBuilder {
 	sb := StackBuilder{
-		stacks: map[Key]Stack{},
+		supportedMedia: supportedMedia,
+		stacks:         map[Key]Stack{},
 	}
-	sb.dateRange.Set("1850-01-04,2030-01-01")
+	_ = sb.dateRange.Set("1850-01-04,2030-01-01")
 
 	return &sb
-
 }
 
-func (sb *StackBuilder) ProcessAsset(ID string, fileName string, captureDate time.Time) {
+func (sb *StackBuilder) ProcessAsset(id string, fileName string, captureDate time.Time) {
 	if !sb.dateRange.InRange(captureDate) {
 		return
 	}
@@ -82,18 +82,18 @@ func (sb *StackBuilder) ProcessAsset(ID string, fileName string, captureDate tim
 	}
 	s, ok := sb.stacks[k]
 	if !ok {
-		s.CoverID = ID
+		s.CoverID = id
 		s.Date = captureDate
 	}
-	s.IDs = append(s.IDs, ID)
+	s.IDs = append(s.IDs, id)
 	s.Names = append(s.Names, path.Base(fileName))
 	if burst {
 		s.StackType = StackBurst
 	}
 	if cover {
-		s.CoverID = ID
+		s.CoverID = id
 	} else if !burst && slices.Contains([]string{".jpeg", ".jpg", ".jpe"}, ext) {
-		s.CoverID = ID
+		s.CoverID = id
 	}
 	sb.stacks[k] = s
 }
@@ -113,7 +113,7 @@ func huaweiBurst(name string) (bool, string, bool) {
 	if len(parts) == 0 {
 		return false, "", false
 	}
-	return true, parts[1], len(parts[3]) > 0
+	return true, parts[1], parts[3] != ""
 }
 
 var pixelBurstRE = regexp.MustCompile(`^(.*)(.RAW-\d+)(\.MP)?(\.COVER)?(\..*)$`)
@@ -123,7 +123,7 @@ func pixelBurst(name string) (bool, string, bool) {
 	if len(parts) == 0 {
 		return false, "", false
 	}
-	return true, parts[1], len(parts[4]) > 0
+	return true, parts[1], parts[4] != ""
 }
 
 var samsungBurstRE = regexp.MustCompile(`^(\d{8}_\d{6})_(\d{3})\..{3}$`)
@@ -151,7 +151,7 @@ func (sb *StackBuilder) Stacks() []Stack {
 		return len(i.IDs) > 1
 	})
 
-	var stacks []Stack
+	stacks := make([]Stack, 0, len(keys))
 	for _, k := range keys {
 		s := sb.stacks[k]
 
@@ -160,12 +160,8 @@ func (sb *StackBuilder) Stacks() []Stack {
 		hasVideo := 0
 
 		for _, n := range s.Names {
-			mime, err := fshelper.MimeFromExt(path.Ext(n))
-			if err != nil {
-				continue
-			}
-			s := strings.Split(mime[0], "/")
-			switch s[0] {
+			s := sb.supportedMedia.TypeFromExt(path.Ext(n))
+			switch s {
 			case "video":
 				hasVideo++
 			case "image":
@@ -183,7 +179,6 @@ func (sb *StackBuilder) Stacks() []Stack {
 		})
 		s.IDs = ids
 		stacks = append(stacks, s)
-
 	}
 	sort.Slice(stacks, func(i, j int) bool {
 		c := stacks[i].Date.Compare(stacks[j].Date)
@@ -194,11 +189,8 @@ func (sb *StackBuilder) Stacks() []Stack {
 			return false
 		}
 		c = strings.Compare(stacks[i].Names[0], stacks[j].Names[0])
-		switch c {
-		case -1:
-			return true
-		}
-		return false
+
+		return c == -1
 	})
 	return stacks
 }

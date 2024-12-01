@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/kr/pretty"
+	"github.com/simulot/immich-go/immich"
 	"github.com/simulot/immich-go/immich/metadata"
 )
 
@@ -28,6 +29,7 @@ func Test_Stack(t *testing.T) {
 				{ID: "1", FileName: "IMG_1234.JPG", DateTaken: metadata.TakeTimeFromName("2023-10-01 10.15.00")},
 				{ID: "2", FileName: "IMG_1234.DNG", DateTaken: metadata.TakeTimeFromName("2023-10-01 10.45.00")},
 			},
+			want: []Stack{},
 		},
 		{
 			name: "issue #67",
@@ -35,6 +37,7 @@ func Test_Stack(t *testing.T) {
 				{ID: "1", FileName: "IMG_5580.HEIC", DateTaken: metadata.TakeTimeFromName("2023-10-01 10.15.00")},
 				{ID: "2", FileName: "IMG_5580.MP4", DateTaken: metadata.TakeTimeFromName("2023-10-01 10.15.00")},
 			},
+			want: []Stack{},
 		},
 		{
 			name: "stack JPG+DNG",
@@ -202,7 +205,7 @@ func Test_Stack(t *testing.T) {
 
 	for _, tt := range tc {
 		t.Run(tt.name, func(t *testing.T) {
-			sb := NewStackBuilder()
+			sb := NewStackBuilder(immich.DefaultSupportedMedia)
 			for _, a := range tt.input {
 				sb.ProcessAsset(a.ID, a.FileName, a.DateTaken)
 			}
@@ -212,10 +215,9 @@ func Test_Stack(t *testing.T) {
 				return got[i].CoverID < got[j].CoverID
 			})
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("difference\n")
+				t.Errorf("difference expected %+v got %+v", tt.want, got)
 				pretty.Ldiff(t, tt.want, got)
 			}
 		})
-
 	}
 }

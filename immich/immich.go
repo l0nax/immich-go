@@ -1,13 +1,47 @@
 package immich
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"sync"
 	"time"
 
+	"github.com/simulot/immich-go/browser"
 	"github.com/simulot/immich-go/helpers/tzone"
 )
+
+// ImmichInterface is an interface that implements the minimal immich client set of features for uploading
+// interface used to mock up the client
+type ImmichInterface interface {
+	SetEndPoint(string)
+	EnableAppTrace(w io.Writer)
+	SetDeviceUUID(string)
+	PingServer(ctx context.Context) error
+	ValidateConnection(ctx context.Context) (User, error)
+	GetServerStatistics(ctx context.Context) (ServerStatistics, error)
+	GetAssetStatistics(ctx context.Context) (UserStatistics, error)
+
+	UpdateAsset(ctx context.Context, ID string, a *browser.LocalAssetFile) (*Asset, error)
+	GetAllAssets(ctx context.Context) ([]*Asset, error)
+	AddAssetToAlbum(context.Context, string, []string) ([]UpdateAlbumResult, error)
+	UpdateAssets(ctx context.Context, IDs []string, isArchived bool, isFavorite bool, latitude float64, longitude float64, removeParent bool, stackParentID string) error
+	GetAllAssetsWithFilter(context.Context, func(*Asset) error) error
+	AssetUpload(context.Context, *browser.LocalAssetFile) (AssetResponse, error)
+	DeleteAssets(context.Context, []string, bool) error
+
+	GetAllAlbums(ctx context.Context) ([]AlbumSimplified, error)
+	GetAlbumInfo(ctx context.Context, id string, withoutAssets bool) (AlbumContent, error)
+	CreateAlbum(ctx context.Context, tilte string, description string, ids []string) (AlbumSimplified, error)
+	GetAssetAlbums(ctx context.Context, ID string) ([]AlbumSimplified, error)
+	DeleteAlbum(ctx context.Context, id string) error
+
+	StackAssets(ctx context.Context, cover string, IDs []string) error
+
+	SupportedMedia() SupportedMedia
+	GetJobs(ctx context.Context) (map[string]Job, error)
+}
 
 type UnsupportedMedia struct {
 	msg string
@@ -108,7 +142,7 @@ type Asset struct {
 	LivePhotoVideoID string            `json:"livePhotoVideoId"`
 	Tags             []any             `json:"tags"`
 	Checksum         string            `json:"checksum"`
-	StackParentId    string            `json:"stackParentId"`
+	StackParentID    string            `json:"stackParentId"`
 	JustUploaded     bool              `json:"-"`
 	Albums           []AlbumSimplified `json:"-"` // Albums that asset belong to
 }
@@ -165,4 +199,12 @@ func (t *ImmichTime) UnmarshalJSON(b []byte) error {
 	}
 	t.Time = ts.In(local)
 	return nil
+}
+
+func (t ImmichTime) MarshalJSON() ([]byte, error) {
+	if t.IsZero() {
+		return json.Marshal("")
+	}
+
+	return json.Marshal(t.Time.Format("\"" + time.RFC3339 + "\""))
 }

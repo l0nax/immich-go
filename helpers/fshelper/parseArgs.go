@@ -1,123 +1,74 @@
 package fshelper
 
 import (
+	"archive/zip"
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
-	"path"
 	"path/filepath"
 	"strings"
-
-	"github.com/simulot/immich-go/helpers/gen"
 )
 
-type argParser struct {
-	googlePhotos bool
-	files        []string
-	paths        map[string][]string
-	zips         []string
-	unsupported  map[string]any
-	err          error
-}
+// ParsePath return a list of FS bases on args
+//
+// Zip files are opened and returned as FS
+// Manage wildcards in path
+//
+// TODO: Implement a tgz reader for non google-photos archives
 
-func ParsePath(args []string, googlePhoto bool) ([]fs.FS, error) {
-	p := argParser{
-		googlePhotos: googlePhoto,
-		unsupported:  map[string]any{},
-		paths:        map[string][]string{},
-	}
+func ParsePath(args []string) ([]fs.FS, error) {
+	var errs error
+	fsyss := []fs.FS{}
 
-	for _, f := range args {
-		if !HasMagic(f) {
-			p.handleFile(f)
-			continue
-		} else {
-			globs, err := filepath.Glob(f)
-			if err != nil {
-				p.err = errors.Join(err)
-				continue
-			}
-			if len(globs) == 0 {
-				p.err = errors.Join(fmt.Errorf("no file matches '%s'", f))
-				continue
-			}
-
-			for _, g := range globs {
-				if p.googlePhotos && strings.ToLower(path.Ext(g)) != ".zip" {
-					return nil, fmt.Errorf("wildcard '%s' not allowed with the google-photos options", filepath.Base(f))
-				}
-				p.handleFile(g)
-			}
-		}
-	}
-
-	fsys := []fs.FS{}
-
-	for _, f := range p.files {
-		d, b := filepath.Split(f)
-		d = filepath.Clean(d)
-		l := append(p.paths[d], b)
-		p.paths[d] = l
-	}
-
-	for pa, l := range p.paths {
-		if len(l) > 0 {
-			f, err := newPathFS(pa, l)
-			if err != nil {
-				p.err = errors.Join(err)
-			} else {
-				fsys = append(fsys, f)
-			}
-		} else {
-			fsys = append(fsys, os.DirFS(pa))
-		}
-	}
-
-	if len(p.zips) > 0 {
-		f, err := multiZip(p.zips...)
+	for _, a := range args {
+		a = filepath.ToSlash(a)
+		files, err := expandNames(a)
 		if err != nil {
-			p.err = errors.Join(err)
-		} else {
-			fsys = append(fsys, f)
+			return nil, err
+		}
+
+		for _, f := range files {
+			lowF := strings.ToLower(f)
+			switch {
+			case strings.HasSuffix(lowF, ".tgz") || strings.HasSuffix(lowF, ".tar.gz"):
+				errs = errors.Join(fmt.Errorf("immich-go cant use tgz archives: %s", filepath.Base(a)))
+			case strings.HasSuffix(lowF, ".zip"):
+				fsys, err := zip.OpenReader(f)
+				if err != nil {
+					errs = errors.Join(errs, fmt.Errorf("%s: %w", a, err))
+					continue
+				}
+				fsyss = append(fsyss, fsys)
+			default:
+				fsys, err := NewGlobWalkFS(f)
+				if err != nil {
+					errs = errors.Join(errs, err)
+					continue
+				}
+				fsyss = append(fsyss, fsys)
+			}
 		}
 	}
-	if len(p.unsupported) > 0 {
-		keys := gen.MapKeys(p.unsupported)
-		for _, k := range keys {
-			p.err = errors.Join(fmt.Errorf("files with extension '%s' are not supported. Check the discussion here https://github.com/simulot/immich-go/discussions/109", k))
-		}
+	if errs != nil {
+		return nil, errs
 	}
-	return fsys, p.err
+	return fsyss, nil
 }
 
-func (p *argParser) handleFile(f string) {
-	i, err := os.Stat(f)
-	if err != nil {
-		p.err = errors.Join(err)
-		return
+func expandNames(name string) ([]string, error) {
+	if HasMagic(name) {
+		return filepath.Glob(name)
 	}
-	if i.IsDir() {
-		if _, exists := p.paths[f]; !exists {
-			p.paths[f] = nil
+	return []string{name}, nil
+}
+
+// CloseFSs closes each FS that provides a Close() error  interface
+func CloseFSs(fsyss []fs.FS) error {
+	var errs error
+	for _, fsys := range fsyss {
+		if closer, ok := fsys.(interface{ Close() error }); ok {
+			errs = errors.Join(errs, closer.Close())
 		}
-		return
 	}
-	ext := strings.ToLower(filepath.Ext(f))
-	if ext == ".zip" {
-		p.zips = append(p.zips, f)
-		return
-	}
-	if ext == ".tgz" {
-		p.unsupported[ext] = nil
-		return
-	}
-	if p.googlePhotos {
-		return
-	}
-	if _, err = MimeFromExt(ext); err == nil {
-		p.files = append(p.files, f)
-	} else {
-		p.unsupported[ext] = nil
-	}
+	return errs
 }
