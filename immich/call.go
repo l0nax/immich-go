@@ -8,9 +8,36 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/simulot/immich-go/internal/fshelper"
+)
+
+const (
+	EndPointGetJobs                = "GetJobs"
+	EndPointSendJobCommand         = "SendJobCommand"
+	EndPointCreateJob              = "CreateJob"
+	EndPointGetAllAlbums           = "GetAllAlbums"
+	EndPointGetAlbumInfo           = "GetAlbumInfo"
+	EndPointAddAsstToAlbum         = "AddAssetToAlbum"
+	EndPointCreateAlbum            = "CreateAlbum"
+	EndPointGetAssetAlbums         = "GetAssetAlbums"
+	EndPointDeleteAlbum            = "DeleteAlbum"
+	EndPointPingServer             = "PingServer"
+	EndPointValidateConnection     = "ValidateConnection"
+	EndPointGetServerStatistics    = "GetServerStatistics"
+	EndPointGetAssetStatistics     = "GetAssetStatistics"
+	EndPointGetSupportedMediaTypes = "GetSupportedMediaTypes"
+	EndPointGetAllAssets           = "GetAllAssets"
+	EndPointUpsertTags             = "UpsertTags"
+	EndPointTagAssets              = "TagAssets"
+	EndPointBulkTagAssets          = "BulkTagAssets"
+	EndPointGetAllTags             = "GetAllTags"
+	EndPointAssetUpload            = "AssetUpload"
+	EndPointAssetReplace           = "AssetReplace"
+	EndPointGetAboutInfo           = "GetAboutInfo"
 )
 
 type TooManyInternalError struct {
@@ -28,10 +55,7 @@ type serverCall struct {
 	ic       *ImmichClient
 	err      error
 	ctx      context.Context
-	p        *paginator
 }
-
-type serverCallOption func(sc *serverCall) error
 
 // callError represents errors returned by the server
 type callError struct {
@@ -40,16 +64,17 @@ type callError struct {
 	url      string
 	status   int
 	err      error
-	message  *ServerMessage
+	message  *ServerErrorMessage
 }
 
-type ServerMessage struct {
-	Error      string   `json:"error"`
-	StatusCode string   `json:"statusCode"`
-	Message    []string `json:"message"`
+type ServerErrorMessage struct {
+	Error         string `json:"error"`
+	StatusCode    int    `json:"statusCode"`
+	Message       string `json:"message"`
+	CorrelationID string `json:"correlationId"`
 }
 
-func (u callError) Is(target error) bool {
+func (ce callError) Is(target error) bool {
 	_, ok := target.(*callError)
 	return ok
 }
@@ -70,36 +95,25 @@ func (ce callError) Error() string {
 		b.WriteString(ce.err.Error())
 		b.WriteRune('\n')
 	}
+
 	if ce.message != nil {
-		if len(ce.message.Error) > 0 {
-			b.WriteString(ce.message.Error)
-			b.WriteRune('\n')
-		}
-		if len(ce.message.Message) > 0 {
-			for _, m := range ce.message.Message {
-				b.WriteString(m)
-				b.WriteRune('\n')
-			}
-		}
+		b.WriteString(ce.message.Message)
+		b.WriteRune('\n')
 	}
+
 	return b.String()
 }
 
-func (ic *ImmichClient) newServerCall(ctx context.Context, api string, opts ...serverCallOption) *serverCall {
+func (ic *ImmichClient) newServerCall(ctx context.Context, api string) *serverCall {
 	sc := &serverCall{
 		endPoint: api,
 		ic:       ic,
 		ctx:      ctx,
 	}
-	if sc.err == nil {
-		for _, opt := range opts {
-			sc.joinError(opt(sc))
-		}
-	}
 	return sc
 }
 
-func (sc *serverCall) Err(req *http.Request, resp *http.Response, msg *ServerMessage) error {
+func (sc *serverCall) Err(req *http.Request, resp *http.Response, msg *ServerErrorMessage) error {
 	ce := callError{
 		endPoint: sc.endPoint,
 		err:      sc.err,
@@ -114,42 +128,28 @@ func (sc *serverCall) Err(req *http.Request, resp *http.Response, msg *ServerMes
 	ce.message = msg
 	return ce
 }
+
 func (sc *serverCall) joinError(err error) error {
 	sc.err = errors.Join(sc.err, err)
 	return err
 }
 
-// paginator controls the paged API calls
-type paginator struct {
-	pageNumber    int    // current page
-	pageParameter string // page parameter name on the URL
-	EOF           bool   // true when the last page was empty
-}
-
-func (p paginator) setPage(v url.Values) {
-	v.Set(p.pageParameter, strconv.Itoa(p.pageNumber))
-}
-
-func (p *paginator) nextPage() {
-	p.pageNumber++
-}
-
-func setPaginator(pageParameter string, startPage int) serverCallOption {
-	return func(sc *serverCall) error {
-		p := paginator{
-			pageParameter: pageParameter,
-			pageNumber:    startPage,
-		}
-		sc.p = &p
-		return nil
-	}
-}
-
 type requestFunction func(sc *serverCall) *http.Request
 
-func (sc *serverCall) request(method string, url string, opts ...serverRequestOption) *http.Request {
+var callSequence atomic.Int64
 
-	req, err := http.NewRequestWithContext(sc.ctx, method, url, nil)
+const ctxCallSequenceID = "api-call-sequence"
+
+func (sc *serverCall) request(
+	method string,
+	url string,
+	opts ...serverRequestOption,
+) *http.Request {
+	if sc.ic.apiTraceWriter != nil && sc.endPoint != EndPointGetJobs {
+		seq := callSequence.Add(1)
+		sc.ctx = context.WithValue(sc.ctx, ctxCallSequenceID, seq)
+	}
+	req, err := http.NewRequestWithContext(sc.ctx, method, url, http.NoBody)
 	if sc.joinError(err) != nil {
 		return nil
 	}
@@ -162,7 +162,7 @@ func (sc *serverCall) request(method string, url string, opts ...serverRequestOp
 	return req
 }
 
-func get(url string, opts ...serverRequestOption) requestFunction {
+func getRequest(url string, opts ...serverRequestOption) requestFunction {
 	return func(sc *serverCall) *http.Request {
 		if sc.err != nil {
 			return nil
@@ -170,16 +170,20 @@ func get(url string, opts ...serverRequestOption) requestFunction {
 		return sc.request(http.MethodGet, sc.ic.endPoint+url, opts...)
 	}
 }
-func post(url string, ctype string, opts ...serverRequestOption) requestFunction {
+
+func postRequest(url string, cType string, opts ...serverRequestOption) requestFunction {
 	return func(sc *serverCall) *http.Request {
 		if sc.err != nil {
 			return nil
 		}
-		return sc.request(http.MethodPost, sc.ic.endPoint+url, append(opts, setContentType(ctype))...)
+		return sc.request(
+			http.MethodPost,
+			sc.ic.endPoint+url,
+			append(opts, setContentType(cType))...)
 	}
 }
 
-func delete(url string, opts ...serverRequestOption) requestFunction {
+func deleteRequest(url string, opts ...serverRequestOption) requestFunction {
 	return func(sc *serverCall) *http.Request {
 		if sc.err != nil {
 			return nil
@@ -188,7 +192,7 @@ func delete(url string, opts ...serverRequestOption) requestFunction {
 	}
 }
 
-func put(url string, opts ...serverRequestOption) requestFunction {
+func putRequest(url string, opts ...serverRequestOption) requestFunction {
 	return func(sc *serverCall) *http.Request {
 		if sc.err != nil {
 			return nil
@@ -196,26 +200,8 @@ func put(url string, opts ...serverRequestOption) requestFunction {
 		return sc.request(http.MethodPut, sc.ic.endPoint+url, opts...)
 	}
 }
+
 func (sc *serverCall) do(fnRequest requestFunction, opts ...serverResponseOption) error {
-	if sc.err != nil || fnRequest == nil {
-		return sc.Err(nil, nil, nil)
-	}
-
-	if sc.p == nil {
-		return sc._callDo(fnRequest, opts...)
-	}
-
-	for !sc.p.EOF {
-		err := sc._callDo(fnRequest, opts...)
-		if err != nil {
-			return err
-		}
-		sc.p.nextPage()
-	}
-	return nil
-}
-
-func (sc *serverCall) _callDo(fnRequest requestFunction, opts ...serverResponseOption) error {
 	var (
 		resp *http.Response
 		err  error
@@ -226,41 +212,71 @@ func (sc *serverCall) _callDo(fnRequest requestFunction, opts ...serverResponseO
 		return sc.Err(req, nil, nil)
 	}
 
-	if sc.p != nil {
-		v := req.URL.Query()
-		sc.p.setPage(v)
-		req.URL.RawQuery = v.Encode()
-	}
-	if sc.ic.ApiTrace /* && req.Header.Get("Content-Type") == "application/json"*/ {
-		setTraceJSONRequest()(sc, req)
+	if sc.ic.apiTraceWriter != nil && sc.endPoint != EndPointGetJobs {
+		_ = sc.joinError(setTraceRequest()(sc, req))
 	}
 
 	resp, err = sc.ic.client.Do(req)
-
 	// any non nil error must be returned
 	if err != nil {
-		sc.joinError(err)
+		_ = sc.joinError(err)
 		return sc.Err(req, nil, nil)
 	}
 
-	// Any StatusCode above 300 denote a problem
+	// Any StatusCode above 300 denotes a problem
 	if resp.StatusCode >= 300 {
-		msg := ServerMessage{}
+		msg := ServerErrorMessage{}
 		if resp.Body != nil {
-			if json.NewDecoder(resp.Body).Decode(&msg) == nil {
+			defer resp.Body.Close()
+			b := bytes.NewBuffer(nil)
+			_, _ = io.Copy(b, resp.Body)
+			if json.NewDecoder(b).Decode(&msg) == nil {
+				if sc.ic.apiTraceWriter != nil && sc.endPoint != EndPointGetJobs {
+					seq := sc.ctx.Value(ctxCallSequenceID)
+					fmt.Fprintln(
+						sc.ic.apiTraceWriter,
+						time.Now().Format(time.RFC3339),
+						"RESPONSE",
+						seq,
+						sc.endPoint,
+						resp.Request.Method,
+						resp.Request.URL.String(),
+					)
+					fmt.Fprintln(sc.ic.apiTraceWriter, "  Status:", resp.Status)
+					fmt.Fprintln(sc.ic.apiTraceWriter, "-- response body --")
+					dec := json.NewEncoder(newLimitWriter(sc.ic.apiTraceWriter, 100))
+					dec.SetIndent("", " ")
+					if err := dec.Encode(msg); err != nil {
+						// return sc.Err(req, resp, &msg)
+					}
+					fmt.Fprint(sc.ic.apiTraceWriter, "-- response body end --\n\n")
+				}
 				return sc.Err(req, resp, &msg)
+			} else {
+				if sc.ic.apiTraceWriter != nil && sc.endPoint != EndPointGetJobs {
+					seq := sc.ctx.Value(ctxCallSequenceID)
+					fmt.Fprintln(
+						sc.ic.apiTraceWriter,
+						time.Now().Format(time.RFC3339),
+						"RESPONSE",
+						seq,
+						sc.endPoint,
+						resp.Request.Method,
+						resp.Request.URL.String(),
+					)
+					fmt.Fprintln(sc.ic.apiTraceWriter, "  Status:", resp.Status)
+					fmt.Fprintln(sc.ic.apiTraceWriter, "-- response body --")
+					fmt.Fprintln(sc.ic.apiTraceWriter, b.String())
+					fmt.Fprint(sc.ic.apiTraceWriter, "-- response body end --\n\n")
+				}
 			}
 		}
-		if resp.Body != nil {
-			resp.Body.Close()
-		}
-		// StatusCode below 500 are
 		return sc.Err(req, resp, &msg)
 	}
 
 	// We have a success
 	for _, opt := range opts {
-		sc.joinError(opt(sc, resp))
+		_ = sc.joinError(opt(sc, resp))
 	}
 	if sc.err != nil {
 		return sc.Err(req, resp, nil)
@@ -277,15 +293,16 @@ func setBody(body io.ReadCloser) serverRequestOption {
 	}
 }
 
-func setHeader(key, value string) serverRequestOption {
-	return func(sc *serverCall, req *http.Request) error {
-		req.Header.Set(key, value)
-		return nil
-	}
-}
 func setAcceptJSON() serverRequestOption {
 	return func(sc *serverCall, req *http.Request) error {
 		req.Header.Add("Accept", "application/json")
+		return nil
+	}
+}
+
+func setOctetStream() serverRequestOption {
+	return func(sc *serverCall, req *http.Request) error {
+		req.Header.Add("Accept", "application/octet-stream")
 		return nil
 	}
 }
@@ -301,36 +318,20 @@ func setJSONBody(object any) serverRequestOption {
 	return func(sc *serverCall, req *http.Request) error {
 		b := bytes.NewBuffer(nil)
 		enc := json.NewEncoder(b)
-		if sc.ic.ApiTrace {
-			enc.SetIndent("", " ")
+		err := enc.Encode(object)
+		if err != nil {
+			return err
 		}
-		if sc.joinError(enc.Encode(object)) == nil {
-			req.Body = io.NopCloser(b)
-		}
+		req.Body = io.NopCloser(b)
 		req.Header.Set("Content-Type", "application/json")
-		return sc.err
+		return err
 	}
 }
 
-func setContentType(ctype string) serverRequestOption {
+func setContentType(cType string) serverRequestOption {
 	return func(sc *serverCall, req *http.Request) error {
-		req.Header.Set("Content-Type", ctype)
-		return sc.err
-	}
-}
-
-func setUrlValues(values url.Values) serverRequestOption {
-	return func(sc *serverCall, req *http.Request) error {
-		if values != nil {
-			rValues := req.URL.Query()
-			for k, v := range values {
-				for _, s := range v {
-					rValues.Set(k, s)
-				}
-			}
-			req.URL.RawQuery = rValues.Encode()
-		}
-		return sc.err
+		req.Header.Set("Content-Type", cType)
+		return nil
 	}
 }
 
@@ -345,82 +346,61 @@ func responseJSON[T any](object *T) serverResponseOption {
 					return nil
 				}
 
-				if sc.joinError(json.NewDecoder(resp.Body).Decode(object)) != nil {
-					return sc.err
+				if sc.ic.apiTraceWriter != nil && sc.endPoint != EndPointGetJobs {
+					sc.ic.apiTraceLock.Lock()
+					defer sc.ic.apiTraceLock.Unlock()
+					resp.Body = hijackBody(resp.Body, sc.ic.apiTraceWriter)
+					seq := sc.ctx.Value(ctxCallSequenceID)
+					fmt.Fprintln(
+						sc.ic.apiTraceWriter,
+						time.Now().Format(time.RFC3339),
+						"RESPONSE",
+						seq,
+						sc.endPoint,
+						resp.Request.Method,
+						resp.Request.URL.String(),
+					)
+					fmt.Fprintln(sc.ic.apiTraceWriter, "  Header:")
+					for k, v := range resp.Header {
+						fmt.Fprintln(sc.ic.apiTraceWriter, "    ", k, ":", strings.Join(v, "; "))
+					}
+					fmt.Fprintln(sc.ic.apiTraceWriter, "  Status:", resp.Status)
+					fmt.Fprintln(sc.ic.apiTraceWriter, "-- response body start --")
+					defer fmt.Fprint(sc.ic.apiTraceWriter, "\n-- response body end --\n\n")
 				}
-				return nil
+
+				err := json.NewDecoder(resp.Body).Decode(object)
+				if err != nil {
+					err = fmt.Errorf("can't decode JSON response: %w", err)
+				}
+				return err
 			}
 		}
 		return errors.New("can't decode nil response")
 	}
 }
 
-func responseAccumulateJSON[T any](acc *[]T) serverResponseOption {
+func responseCopy(buffer *bytes.Buffer) serverResponseOption {
 	return func(sc *serverCall, resp *http.Response) error {
-		if sc.p != nil {
-			sc.p.EOF = true
-		}
 		if resp != nil {
 			if resp.Body != nil {
-				defer resp.Body.Close()
-				if resp.StatusCode == http.StatusNoContent {
-					return nil
-				}
-				arr := []T{}
-				if sc.joinError(json.NewDecoder(resp.Body).Decode(&arr)) != nil {
-					return sc.err
-				}
-				if len(arr) > 0 && sc.p != nil {
-					sc.p.EOF = false
-				}
-				(*acc) = append((*acc), arr...)
+				newBody := fshelper.TeeReadCloser(resp.Body, buffer)
+				resp.Body = newBody
 				return nil
 			}
 		}
-		return errors.New("can't decode nil response")
+		return nil
 	}
 }
 
-func responseJSONWithFilter[T any](filter func(*T)) serverResponseOption {
+func responseOctetStream(rc *io.ReadCloser) serverResponseOption {
 	return func(sc *serverCall, resp *http.Response) error {
-		if sc.p != nil {
-			sc.p.EOF = true
-		}
 		if resp != nil {
 			if resp.Body != nil {
-				defer resp.Body.Close()
-				if resp.StatusCode == http.StatusNoContent {
-					return nil
-				}
-				dec := json.NewDecoder(resp.Body)
-				// read open bracket "["
-				_, err := dec.Token()
-				if sc.joinError(err) != nil {
-					return sc.err
-				}
-
-				// while the array contains values
-				for dec.More() {
-					var o T
-					// decode an array value (Message)
-					err := dec.Decode(&o)
-					if sc.joinError(err) != nil {
-						return sc.err
-					}
-					if sc.p != nil {
-						sc.p.EOF = false
-					}
-					filter(&o)
-				}
-				// read closing bracket "]"
-				_, err = dec.Token()
-				if sc.joinError(err) != nil {
-					return sc.err
-				}
-
+				*rc = resp.Body
 				return nil
 			}
 		}
-		return errors.New("can't decode nil response")
+		return nil
 	}
 }

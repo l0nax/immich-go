@@ -15,7 +15,7 @@ type testServer struct {
 
 func (ts *testServer) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
 	resp.WriteHeader(ts.responseStatus)
-	resp.Write([]byte(ts.responseBody))
+	_, _ = resp.Write([]byte(ts.responseBody))
 }
 
 func TestCall(t *testing.T) {
@@ -27,7 +27,7 @@ func TestCall(t *testing.T) {
 	}{
 		{
 			name:        "happy path",
-			requestFn:   get("/assets", setAcceptJSON()),
+			requestFn:   getRequest("/assets", setAcceptJSON()),
 			expectedErr: false,
 			server: testServer{
 				responseStatus: http.StatusOK,
@@ -36,7 +36,7 @@ func TestCall(t *testing.T) {
 		},
 		{
 			name:        "bad url",
-			requestFn:   get("/ass\nets", setAcceptJSON()),
+			requestFn:   getRequest("/ass\nets", setAcceptJSON()),
 			expectedErr: true,
 			server: testServer{
 				responseStatus: http.StatusOK,
@@ -45,7 +45,7 @@ func TestCall(t *testing.T) {
 		},
 		{
 			name:        "post / ok",
-			requestFn:   post("/album", "application/json", setAcceptJSON(), setJSONBody(struct{ Name string }{Name: "test"})),
+			requestFn:   postRequest("/albums", "application/json", setAcceptJSON(), setJSONBody(struct{ Name string }{Name: "test"})),
 			expectedErr: false,
 			server: testServer{
 				responseStatus: http.StatusOK,
@@ -54,7 +54,7 @@ func TestCall(t *testing.T) {
 		},
 		{
 			name:        "bad request / post",
-			requestFn:   post("/album", "application/json", setAcceptJSON(), setJSONBody(struct{ Name string }{Name: "test"})),
+			requestFn:   postRequest("/albums", "application/json", setAcceptJSON(), setJSONBody(struct{ Name string }{Name: "test"})),
 			expectedErr: true,
 			server: testServer{
 				responseStatus: http.StatusBadRequest,
@@ -68,12 +68,12 @@ func TestCall(t *testing.T) {
 			server := httptest.NewServer(&tst.server)
 			defer server.Close()
 			ctx := context.Background()
-			ic, err := NewImmichClient(server.URL, "1234", false)
+			ic, err := NewImmichClient(server.URL, "1234")
 			if err != nil {
 				t.Fail()
 				return
 			}
-			ic.EnableAppTrace(true)
+			// ic.EnableAppTrace(true)
 			r := map[string]string{}
 			err = ic.newServerCall(ctx, tst.name).do(tst.requestFn, responseJSON(&r))
 			if tst.expectedErr && err == nil {
@@ -88,5 +88,4 @@ func TestCall(t *testing.T) {
 			t.Logf("response received: %#v", r)
 		})
 	}
-
 }
